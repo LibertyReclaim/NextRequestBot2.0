@@ -231,6 +231,8 @@ class RequestSubmitter:
         mapping = self._classify_interactables(interactables)
         value_map = self._build_value_map(municipality)
         unmet_required = self._apply_interactable_actions(interactables, mapping, value_map)
+        ai_unmet_required = self._resolve_unhandled_required_fields(municipality, value_map)
+        unmet_required.extend(ai_unmet_required)
 
         interactables_after = self._scan_interactable_elements()
         mapping_after = self._classify_interactables(interactables_after)
@@ -545,6 +547,259 @@ class RequestSubmitter:
 
         return unmet_required
 
+    def _resolve_unhandled_required_fields(self, municipality: str, value_map: Dict[str, str]) -> List[str]:
+        interactables = self._scan_interactable_elements()
+        mapping = self._classify_interactables(interactables)
+        unresolved = self._collect_unresolved_required_fields(interactables, mapping)
+        print("[request_submitter] unresolved required fields:")
+        for field in unresolved:
+            print(
+                f"  - id={field.get('element_id')} label={field.get('label')} type={field.get('type')} "
+                f"tag={field.get('tag')} options={field.get('options')} nearby={field.get('nearby_text')}"
+            )
+
+        if not unresolved or not hasattr(self.ai_mapper, "resolve_required_fields"):
+            return []
+
+        request_context = {
+            "municipality": municipality,
+            "request_description": value_map.get("request_description", ""),
+            "requester_city": value_map.get("city", ""),
+            "requester_state": value_map.get("state", ""),
+            "requester_zip": value_map.get("zip", ""),
+        }
+        decisions = self.ai_mapper.resolve_required_fields(unresolved, request_context)
+        print(f"[request_submitter] OpenAI required-field decisions: {decisions}")
+
+        unmet: List[str] = []
+        for field in unresolved:
+            element_id = str(field.get("element_id", ""))
+            decision = decisions.get(element_id, {"action": "skip", "value": "", "reason": "no decision"})
+            success = self._apply_required_field_decision(field, decision)
+            print(
+                "[request_submitter] required-field final value "
+                f"id={element_id} action={decision.get('action')} value={decision.get('value')} "
+                f"success={success} reason={decision.get('reason')}"
+            )
+            if not success:
+                unmet.append(f"{element_id}: unresolved required field not filled by OpenAI decision")
+        return unmet
+
+    def _collect_unresolved_required_fields(self, interactables: List[Dict], mapping: Dict[str, str]) -> List[Dict]:
+        fields: List[Dict] = []
+        for element in interactables:
+            if not element.get("required"):
+                continue
+            if mapping.get(element["element_id"]) == "submit_button":
+                continue
+            tag = str(element.get("tag", "")).lower()
+            input_type = str(element.get("type", "")).lower()
+            if tag in {"button", "a"} or input_type in {"submit", "button", "hidden"}:
+                continue
+            current_value = self._current_value_by_element_id(element["element_id"])
+            checked = bool(element.get("checked"))
+            empty = False
+            if input_type in {"checkbox", "radio"}:
+                empty = not checked
+            elif tag == "select":
+                empty = not current_value or current_value.lower() in {"select", "choose", "please select"}
+            else:
+                empty = not current_value
+            invalid = self._element_appears_invalid(element["element_id"])
+            if not empty and not invalid:
+                continue
+            options = self._collect_options_for_element_id(element["element_id"])
+            if self._looks_like_department_element(element):
+                print(
+                    f"[request_submitter] department required options collected id={element['element_id']} options={options}"
+                )
+            fields.append(
+                {
+                    "element_id": element["element_id"],
+                    "semantic_hint": mapping.get(element["element_id"], "ignore"),
+                    "label": self._field_label_text(element),
+                    "tag": tag,
+                    "type": input_type,
+                    "placeholder": element.get("placeholder", ""),
+                    "visible_text": element.get("text_content", ""),
+                    "nearby_text": element.get("nearby_text", ""),
+                    "current_value": current_value,
+                    "checked": checked,
+                    "options": options,
+                }
+            )
+        return fields
+
+    def _field_label_text(self, element: Dict) -> str:
+        return " ".join(
+            [
+                str(element.get("label_text", "")),
+                str(element.get("aria_label", "")),
+                str(element.get("placeholder", "")),
+                str(element.get("name", "")),
+                str(element.get("id", "")),
+            ]
+        ).strip()
+
+    def _looks_like_department_element(self, element: Dict) -> bool:
+        blob = " ".join(
+            [
+                str(element.get("label_text", "")),
+                str(element.get("nearby_text", "")),
+                str(element.get("placeholder", "")),
+                str(element.get("name", "")),
+                str(element.get("id", "")),
+                str(element.get("aria_label", "")),
+            ]
+        ).lower()
+        return "department" in blob
+
+    def _current_value_by_element_id(self, element_id: str) -> str:
+        try:
+            return str(
+                self.page.evaluate(
+                    """
+                    (id) => {
+                      const el = document.querySelector(`[data-nr-form-el-id="${id}"]`);
+                      if (!el) return '';
+                      const type = (el.getAttribute('type') || '').toLowerCase();
+                      if (type === 'checkbox' || type === 'radio') return el.checked ? 'checked' : '';
+                      return ('value' in el ? el.value : el.innerText || '').toString().trim();
+                    }
+                    """,
+                    element_id,
+                )
+            ).strip()
+        except Exception:
+            return ""
+
+    def _element_appears_invalid(self, element_id: str) -> bool:
+        try:
+            return bool(
+                self.page.evaluate(
+                    """
+                    (id) => {
+                      const el = document.querySelector(`[data-nr-form-el-id="${id}"]`);
+                      if (!el) return false;
+                      const cls = (el.className || '').toString().toLowerCase();
+                      const invalidByClass = /invalid|error|required|is-invalid/.test(cls);
+                      const invalidByAria = (el.getAttribute('aria-invalid') || '').toLowerCase() === 'true';
+                      return invalidByClass || invalidByAria;
+                    }
+                    """,
+                    element_id,
+                )
+            )
+        except Exception:
+            return False
+
+    def _collect_options_for_element_id(self, element_id: str) -> List[str]:
+        locator = self.page.locator(f"[data-nr-form-el-id='{element_id}']")
+        options: List[str] = []
+        for item in locator.all():
+            options = self._collect_real_options_from_locator(item)
+            if options:
+                break
+        print(f"[request_submitter] options collected id={element_id}: {options}")
+        return options
+
+    def _collect_real_options_from_locator(self, locator: Locator) -> List[str]:
+        try:
+            tag = locator.evaluate("el => el.tagName.toLowerCase()")
+            if tag == "select":
+                raw_options = locator.evaluate(
+                    """
+                    el => Array.from(el.options)
+                      .map(o => (o.textContent || '').replace(/\s+/g,' ').trim())
+                      .filter(Boolean)
+                    """
+                )
+                return self._filter_real_option_texts(raw_options)
+
+            locator.scroll_into_view_if_needed(timeout=1000)
+            locator.click(timeout=1500)
+            self.page.wait_for_timeout(500)
+            raw_options = self._get_global_visible_option_texts()
+            return self._filter_real_option_texts(raw_options)
+        except Exception:
+            return []
+
+    def _filter_real_option_texts(self, options: List[str]) -> List[str]:
+        blocked = {
+            "make request",
+            "faq",
+            "help",
+            "privacy",
+            "terms",
+            "documents",
+            "all requests",
+            "fee schedule",
+            "public records policy",
+        }
+        clean: List[str] = []
+        for option in options:
+            text = str(option).strip()
+            if not text:
+                continue
+            low = text.lower()
+            if low in blocked or low in {"select", "choose", "please select", "select one"}:
+                continue
+            if len(text) > 120:
+                continue
+            if text not in clean:
+                clean.append(text)
+        return clean
+
+    def _apply_required_field_decision(self, field: Dict, decision: Dict[str, Any]) -> bool:
+        element_id = str(field.get("element_id", ""))
+        action = str(decision.get("action", "skip"))
+        value = str(decision.get("value", "")).strip()
+        if not element_id or action == "skip":
+            return False
+        field_type = str(field.get("type", "")).lower()
+        tag = str(field.get("tag", "")).lower()
+        options = [str(o) for o in field.get("options", [])]
+
+        if field_type in {"checkbox", "radio"} or action in {"check", "choose_radio"}:
+            return self._check_element_by_id(element_id)
+
+        if action == "select_option" or tag == "select" or options:
+            option = self._match_decision_to_option(value, options) if options else value
+            if not option:
+                return False
+            return self._select_option_or_combobox_by_element_id(element_id, option)
+
+        if action == "fill" and value:
+            return self._fill_element_by_id(element_id, value)
+        return False
+
+    def _match_decision_to_option(self, value: str, options: List[str]) -> str:
+        if not options:
+            return value
+        value_l = value.lower().strip()
+        for option in options:
+            if option.lower().strip() == value_l:
+                return option
+        for option in options:
+            if value_l and (value_l in option.lower() or option.lower() in value_l):
+                return option
+        best = None
+        for option in options:
+            score = SequenceMatcher(None, option.lower(), value_l).ratio()
+            if best is None or score > best[1]:
+                best = (option, score)
+        return best[0] if best and best[1] >= 0.55 else ""
+
+    def _select_option_or_combobox_by_element_id(self, element_id: str, option_text: str) -> bool:
+        locator = self.page.locator(f"[data-nr-form-el-id='{element_id}']")
+        for item in locator.all():
+            try:
+                if self._select_department_option_from_control(item, option_text):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _set_state_by_element_id(self, element_id: str) -> bool:
         locator = self.page.locator(f"[data-nr-form-el-id='{element_id}']")
         for item in locator.all():
@@ -613,9 +868,14 @@ class RequestSubmitter:
         for item in locator.all():
             try:
                 tag = item.evaluate("el => el.tagName.toLowerCase()")
-                options = self._get_visible_department_options(item)
+                options = self._collect_real_options_from_locator(item)
                 if options:
                     print(f"[request_submitter] available department options: {options}")
+                    ai_choice = self._ai_choose_department_option(options)
+                    print(f"[request_submitter] OpenAI department decision from real options: {ai_choice}")
+                    if ai_choice and self._select_department_option_from_control(item, ai_choice):
+                        print(f"[request_submitter] final chosen department={ai_choice} via openai real-options")
+                        return True
 
                 if tag == "select":
                     # Step A+B direct/variant selection in select
@@ -709,7 +969,7 @@ class RequestSubmitter:
             options = self.page.evaluate(
                 """
                 () => {
-                  const sels = ['[role="listbox"] [role="option"]','[role="menu"] [role="menuitem"]','li[role="option"]','li','.select-option','.dropdown-item','.menu-item'];
+                  const sels = ['[role="listbox"] [role="option"]','[role="option"]','[role="menu"] [role="menuitem"]'];
                   const nodes = Array.from(new Set(Array.from(document.querySelectorAll(sels.join(',')))));
                   const visible = nodes.filter(el => {
                     const s = window.getComputedStyle(el);
