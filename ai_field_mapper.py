@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from openai import OpenAI
 
@@ -187,58 +187,3 @@ class AIFieldMapper:
 
         normalized = {o.strip().lower(): o for o in options}
         return normalized.get(selected.strip().lower())
-
-    def resolve_required_fields(self, fields: List[Dict], request_context: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """Choose values/actions for unresolved required form fields."""
-        if not fields:
-            return {}
-
-        prompt = {
-            "task": "These are required fields on a public records request form. Determine what value should be entered for each field based on the request context.",
-            "request_context": request_context,
-            "instructions": [
-                "Return STRICT JSON only: {\"decisions\": [{\"element_id\": \"...\", \"action\": \"fill|select_option|check|choose_radio|skip\", \"value\": \"...\", \"reason\": \"...\"}]}",
-                "For dropdowns/comboboxes, choose exactly one option from the field's provided options when options are present.",
-                "For department fields, choose the best actual provided option for routing a public records request; prefer Controller > Tax > Finance > Clerk > Records > Administration when applicable.",
-                "For checkbox/radio required gates, choose the option that truthfully allows a general public records request to proceed, such as non-police/non-court disclaimers or acknowledgement/certification boxes.",
-                "For date ranges, use a broad relevant range when no exact dates are specified, such as 'All available records' or leave skip only if no safe value exists.",
-                "For property-address questions, answer 'No' unless the request context clearly seeks a specific property address.",
-                "Never invent dropdown options that are not in the provided options list.",
-            ],
-            "fields": fields,
-        }
-
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You fill unresolved required fields for public records request web forms using only safe, context-appropriate values.",
-                },
-                {"role": "user", "content": json.dumps(prompt)},
-            ],
-        )
-
-        payload = json.loads(completion.choices[0].message.content or "{}")
-        decisions = payload.get("decisions", [])
-        clean: Dict[str, Dict[str, Any]] = {}
-        valid_actions = {"fill", "select_option", "check", "choose_radio", "skip"}
-        valid_ids = {str(field.get("element_id", "")) for field in fields}
-        for decision in decisions:
-            if not isinstance(decision, dict):
-                continue
-            element_id = str(decision.get("element_id", ""))
-            if element_id not in valid_ids:
-                continue
-            action = str(decision.get("action", "skip"))
-            if action not in valid_actions:
-                action = "skip"
-            clean[element_id] = {
-                "action": action,
-                "value": str(decision.get("value", "")),
-                "reason": str(decision.get("reason", "")),
-            }
-        return clean
-
